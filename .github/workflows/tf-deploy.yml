@@ -1,0 +1,159 @@
+name: Terraform Deploy
+
+on:
+  # Permit targeted manual trigger within console
+  workflow_dispatch:
+    inputs:
+      location:
+        description: 'Env to deploy to'
+        type: choice
+        required: true
+        options:
+          - dev-s001
+          - stg-s001
+
+  # Permits trigger from orchestration layer
+  workflow_call:
+    inputs:
+      location:
+        required: true
+        type: string
+
+env:
+  tf_version: 1.4.5
+  ARM_USE_OIDC: true
+
+permissions:
+  id-token: write
+  contents: read
+  repository-projects: read
+
+jobs:
+  plan:
+    name: TF Plan
+    runs-on: az-terraform
+    outputs:
+      TF_APPLY_ENVIRONMENT: ${{ steps.set-tf-apply-env.outputs.ENVIRONMENT }}
+      TF_CHANGES: ${{ steps.tf-changes-test.outputs.TF_CHANGES }}
+      
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.tf_version }}
+
+      - name: az login
+        uses: azure/login@v1
+        with:
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+      
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config="resource_group_name=${{ env.tf_storage_resource_group_name }}" \
+            -backend-config="storage_account_name=${{ env.tf_storage_account_name }}" \
+            -backend-config="container_name=${{ env.tf_storage_container_name }}" \
+            -backend-config="key=${{ env.tf_state_filename }}.tfstate"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -input=false \
+            -var-file="data/${{ env.solution_name }}.tfvars" \
+            -out tf.plan
+
+      - name: Terraform No Change Test
+        id: tf-changes-test
+        run: |
+          # Check the tf.plan file, see if there are any changes
+          if terraform show tf.plan | grep -q "Your infrastructure matches the configuration."; then
+            echo "TF_CHANGES=false" >> $GITHUB_OUTPUT  
+            echo "There are no changes for terraform to apply, exiting."
+          else
+            echo "TF_CHANGES=true" >> $GITHUB_OUTPUT
+            echo "There are changes for terraform to apply, continuing."
+          fi
+
+      - name: Cache Files
+        id: cache-files
+        # Attempt to run only when there are TF changes
+        if: steps.tf-changes-test.outputs.TF_CHANGES == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: tf-cache-${{ github.run_id }}-${{ inputs.location }}
+          retention-days: 365 # max 400 for private repos, 90 for public
+          # Grab the entire workspace, but exclude the .terraform folder
+          # It's large and has provider binaries we can easily download in deploy step
+          path: |
+            ${{ github.workspace }}/
+            !${{ github.workspace }}/.terraform
+
+      - name: Set TF Apply Environment
+        # Attempt to run only when there are TF changes
+        if: steps.tf-changes-test.outputs.TF_CHANGES == 'true'
+        id: set-tf-apply-env
+        run: |
+          echo "ENVIRONMENT=$TF_APPLY_ENV" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: Deploy
+    needs: plan
+    # Attempt to run only when there are TF changes
+    if: |
+      needs.plan.outputs.TF_CHANGES == 'true'
+    runs-on: az-terraform
+    environment: ${{ needs.plan.outputs.TF_APPLY_ENVIRONMENT }}
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Download Env Vars
+      id: download-env-vars
+      uses: actions/download-artifact@v3
+      with:
+        name: env-cache-${{ github.run_id }}-${{ inputs.location }}
+
+    - name: Read Env Vars
+      id: read-env-vars
+      run: |
+        cat env.vars >> $GITHUB_ENV
+
+    - name: Install Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.tf_version }}
+
+    - name: az login
+      uses: azure/login@v1
+      with:
+        tenant-id: ${{ env.ARM_TENANT_ID }}
+        client-id: ${{ env.ARM_CLIENT_ID }}
+        subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+    - name: Terraform Init
+      id: init
+      run: |
+        terraform init \
+          -input=false \
+          -backend-config="resource_group_name=${{ env.tf_storage_resource_group_name }}" \
+          -backend-config="storage_account_name=${{ env.tf_storage_account_name }}" \
+          -backend-config="container_name=${{ env.tf_storage_container_name }}" \
+          -backend-config="key=${{ env.tf_state_filename }}.tfstate"
+
+    - name: Download Cache
+      id: download-cache
+      uses: actions/download-artifact@v3
+      with:
+        name: tf-cache-${{ github.run_id }}-${{ inputs.location }}
+
+    - name: Terraform Apply
+      id: apply
+      run: |
+        terraform apply -input=false tf.plan
