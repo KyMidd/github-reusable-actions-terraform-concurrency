@@ -1,0 +1,97 @@
+name: Terraform Batch
+
+on:
+  # Permit targeted manual trigger within console
+  workflow_dispatch:
+    inputs:
+      pod-selection-regex:
+        description: Regex to match pods to deploy, e.g. "dev-s00[1-5]" or substring match like "s001", use asterisk "*" to select all Pods
+        type: string
+        required: true
+        default: '*'
+      concurrency:
+        description: Deploy strategy, concurrent or sequential
+        type: choice
+        required: true
+        default: concurrent
+        options:
+          - concurrent
+          - sequential
+
+jobs:
+  
+  gather-info:
+    name: Gather information
+    runs-on: ubuntu-latest
+    
+    # Set outputs for orchestration job
+    outputs:
+      MAX_PARALLEL: ${{ steps.set-deploy-strategy.outputs.MAX_PARALLEL }}
+      TARGETED_PODS: ${{ steps.set-targeted-pods.outputs.TARGETED_PODS }}
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set Concurrency to ${{ github.event.inputs.concurrency == 'concurrent' && 100 || 1 }}
+      id: set-deploy-strategy
+      run: |
+        # If strategy is concurrent, max parallel is set to 100 (arbitrarily high number)
+        if [[ ${{ github.event.inputs.concurrency }} == "concurrent" ]]; then
+          echo "Concurrent deployment strategy selected, max parallel set to 100"
+          echo "MAX_PARALLEL=100" >> $GITHUB_OUTPUT
+
+        # If strategy is sequential, max parallel is set to 1
+        elif [[ ${{ github.event.inputs.concurrency }} == "sequential" ]]; then
+          echo "Concurrent deployment strategy selected, max parallel set to 100"
+          echo "MAX_PARALLEL=1" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Specify pods to deploy using regex ${{ github.event.inputs.pod-selection-regex }}
+      id: set-targeted-pods
+      run: |
+
+        # Read TF apply workfile as var
+        WORKFILE=$(cat ./.github/workflows/tf-deploy.yml)
+        
+        # Get all targateable pods from workflow file
+        ALL_PODS=$(echo "$WORKFILE" | yq .on.workflow_dispatch.inputs.location.options | cut -d " " -f 2)
+        
+        # If pod-selection-regex set to wildcard, select all pods
+        if [[ ${{ github.event.inputs.pod-selection-regex }} == "*" ]]; then
+          echo "Wildcard used to select all pods, selecting all pods"
+          TARGETED_PODS=$ALL_PODS
+        else
+          echo "Wildcard not used to select all pods, selecting pods using regex"
+          TARGETED_PODS=$(echo "$ALL_PODS" | grep -E "${{ github.event.inputs.pod-selection-regex }}" )
+        fi
+
+        # Print out list of pods we'll be targeting
+        echo "We'll be targeting the following pods:"
+        while IFS=$'\n' read -r POD; do
+          echo "- $POD"
+        done <<< "$TARGETED_PODS"
+
+        # Remove old file and put all pods into list like: 'pod1','pod2','pod3'
+        rm -f TARGETED_PODS_HOLDER
+        while IFS=$'\n' read -r POD; do
+          printf "'$POD'", >> TARGETED_PODS_HOLDER
+        done <<< "$TARGETED_PODS"
+
+        # Read file as var and remove trailing comma
+        TARGETED_PODS_OUTPUT=$(cat TARGETED_PODS_HOLDER | sed 's/,$//')
+
+        # Send TARGETED_PODS to output
+        echo "TARGETED_PODS=[${TARGETED_PODS_OUTPUT}]" >> $GITHUB_OUTPUT
+  
+  batch:
+    needs: gather-info
+    name: Batch
+    uses: ./.github/workflows/tf-deploy.yml
+    secrets: inherit
+    with:
+      location: ${{ matrix.pod }}
+    strategy:
+      max-parallel: ${{ fromJSON(needs.gather-info.outputs.MAX_PARALLEL) }}
+      fail-fast: false
+      matrix:
+        pod: ${{ fromJSON(needs.gather-info.outputs.TARGETED_PODS) }}
