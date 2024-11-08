@@ -85,7 +85,7 @@ jobs:
         id: cache-files
         # Attempt to run only when there are TF changes
         if: steps.tf-changes-test.outputs.TF_CHANGES == 'true'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: tf-cache-${{ github.run_id }}-${{ inputs.location }}
           retention-days: 365 # max 400 for private repos, 90 for public
@@ -116,7 +116,7 @@ jobs:
     
     - name: Download Env Vars
       id: download-env-vars
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         name: env-cache-${{ github.run_id }}-${{ inputs.location }}
 
@@ -149,7 +149,7 @@ jobs:
 
     - name: Download Cache
       id: download-cache
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         name: tf-cache-${{ github.run_id }}-${{ inputs.location }}
 
